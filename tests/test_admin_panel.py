@@ -81,6 +81,54 @@ async def seed_event():
     return event, room, booth
 
 
+@pytest.fixture
+async def room_scope_events():
+    """Two event rooms with an owner scoped only to the first event."""
+    from portal.database import (
+        create_booth,
+        create_event,
+        create_invite_token,
+        create_room,
+        create_user,
+        get_session,
+        set_booth_membership,
+        set_event_membership,
+        set_room_membership,
+    )
+
+    async with get_session() as s:
+        event_a = await create_event(s, slug="scope-a", display_name="Event A")
+        event_b = await create_event(s, slug="scope-b", display_name="Event B")
+        room_a = await create_room(s, event_id=event_a.id, display_name="A room")
+        room_b = await create_room(s, event_id=event_b.id, display_name="B room")
+        booth_a = await create_booth(
+            s, event_id=event_a.id, room_id=room_a.id, language_code="en", language_name="English"
+        )
+        booth_b = await create_booth(
+            s, event_id=event_b.id, room_id=room_b.id, language_code="fr", language_name="French"
+        )
+        invite_b = await create_invite_token(s, booth_id=booth_b.id, role="interpreter")
+        owner = await create_user(s, email="scope-owner@example.com", display_name="Owner A")
+        member = await create_user(s, email="scope-member@example.com", display_name="Interpreter B")
+        coordinator = await create_user(s, email="scope-coordinator@example.com", display_name="Coordinator A")
+        await set_event_membership(s, user_id=owner.id, event_id=event_a.id, role="event_owner")
+        booth_membership = await set_booth_membership(s, user_id=member.id, booth_id=booth_b.id, role="interpreter")
+        await set_room_membership(s, user_id=coordinator.id, room_id=room_a.id, role="room_coordinator")
+
+        return {
+            "event_a": event_a.id,
+            "event_b": event_b.id,
+            "room_a": room_a.id,
+            "room_b": room_b.id,
+            "booth_a": booth_a.id,
+            "booth_b": booth_b.id,
+            "invite_b": invite_b.token,
+            "booth_membership_b": booth_membership.id,
+            "owner_cookie": {"user_token": create_user_token(user_id=owner.id, email=owner.email)},
+            "coordinator_cookie": {"user_token": create_user_token(user_id=coordinator.id, email=coordinator.email)},
+        }
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -673,6 +721,148 @@ class TestEventCRUD:
         assert event.created_at.strftime("%Y-%m-%d").encode() not in resp.content
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("search_term", ("SUMMIT", "fossasia"))
+    async def test_event_list_searches_by_slug_or_display_name_case_insensitively(
+        self, admin_cookie, seed_event, search_term
+    ):
+        from portal.database import create_event, get_session
+
+        async with get_session() as session:
+            await create_event(session, slug="community-summit-2026", display_name="FOSSASIA Community")
+
+        async with _client() as c:
+            resp = await c.get("/admin/events/", params={"search": search_term}, cookies=admin_cookie)
+
+        assert resp.status_code == 200
+        assert "FOSSASIA Community" in resp.text
+        assert "community-summit-2026" in resp.text
+        assert "testcon" not in resp.text
+        assert f'value="{search_term}"' in resp.text
+        assert '<label for="admin-event-search" class="search-label">Search events by name or slug</label>' in resp.text
+        assert 'aria-label="Search events by name or slug"' in resp.text
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("search_term", ("", "   "))
+    async def test_event_list_empty_search_shows_all_events(self, admin_cookie, seed_event, search_term):
+        from portal.database import create_event, get_session
+
+        async with get_session() as session:
+            await create_event(session, slug="unrelated-event", display_name="Unrelated Event")
+
+        async with _client() as c:
+            resp = await c.get("/admin/events/", params={"search": search_term}, cookies=admin_cookie)
+
+        assert resp.status_code == 200
+        assert "TestCon 2026" in resp.text
+        assert "Unrelated Event" in resp.text
+        assert 'value=""' in resp.text
+        assert 'href="/admin/events/" class="btn">Clear</a>' not in resp.text
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("search_term", "literal_name", "near_match"),
+        [
+            ("Alpha_Beta", "Alpha_Beta", "AlphaXBeta"),
+            ("Alpha%Beta", "Alpha%Beta", "AlphaXBeta"),
+            ("Alpha\\Beta", "Alpha\\Beta", "AlphaBeta"),
+        ],
+    )
+    async def test_event_list_search_treats_like_wildcards_literally(
+        self, admin_cookie, search_term, literal_name, near_match
+    ):
+        from portal.database import create_event, get_session
+
+        async with get_session() as session:
+            await create_event(session, slug="literal-match", display_name=literal_name)
+            await create_event(session, slug="near-match", display_name=near_match)
+
+        async with _client() as c:
+            resp = await c.get("/admin/events/", params={"search": search_term}, cookies=admin_cookie)
+
+        assert resp.status_code == 200
+        assert "literal-match" in resp.text
+        assert "near-match" not in resp.text
+
+    @pytest.mark.anyio
+    async def test_event_list_pagination_url_encodes_search(self, admin_cookie):
+        from portal.database import create_event, get_session
+
+        search_term = "special&#"
+        async with get_session() as session:
+            for index in range(21):
+                await create_event(
+                    session,
+                    slug=f"special-search-{index}",
+                    display_name=f"{search_term} event {index}",
+                )
+
+        async with _client() as c:
+            resp = await c.get("/admin/events/", params={"search": search_term}, cookies=admin_cookie)
+
+        assert resp.status_code == 200
+        assert 'href="?page=2&amp;search=special%26%23"' in resp.text
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("event_count", "requested_page", "expected_page"),
+        [
+            pytest.param(1, 2, 1, id="single-result"),
+            pytest.param(21, 99, 2, id="last-page"),
+        ],
+    )
+    async def test_event_list_clamps_out_of_range_search_page(
+        self, admin_cookie, event_count, requested_page, expected_page
+    ):
+        from portal.database import create_event, get_session
+
+        search_term = "pagination-target"
+        async with get_session() as session:
+            for index in range(event_count):
+                await create_event(
+                    session,
+                    slug=f"{search_term}-{index}",
+                    display_name=f"Pagination Target {index}",
+                )
+
+        async with _client() as c:
+            resp = await c.get(
+                "/admin/events/",
+                params={"search": search_term, "page": requested_page},
+                cookies=admin_cookie,
+            )
+
+        assert resp.status_code == 200
+        assert f"Page {requested_page} is out of range. Showing page {expected_page}." in resp.text
+        assert f'href="?page={expected_page}&amp;search={search_term}">View page {expected_page}</a>' in resp.text
+        assert f"{search_term}-{event_count - 1}" in resp.text
+        assert "No events match search" not in resp.text
+
+    @pytest.mark.anyio
+    async def test_event_list_out_of_range_page_with_no_matches_only_shows_empty_state(self, admin_cookie, seed_event):
+        async with _client() as c:
+            resp = await c.get(
+                "/admin/events/",
+                params={"search": "no-such-event", "page": 99},
+                cookies=admin_cookie,
+            )
+
+        assert resp.status_code == 200
+        assert "No events match search" in resp.text
+        assert "Page 99 is out of range" not in resp.text
+        assert "View page" not in resp.text
+
+    @pytest.mark.anyio
+    async def test_event_list_search_with_no_matches_shows_clearable_empty_state(self, admin_cookie, seed_event):
+        async with _client() as c:
+            resp = await c.get("/admin/events/", params={"search": "no-such-event"}, cookies=admin_cookie)
+
+        assert resp.status_code == 200
+        assert "No events match search" in resp.text
+        assert 'name="search"' in resp.text
+        assert 'href="/admin/events/" class="btn">Clear</a>' in resp.text
+        assert "testcon" not in resp.text
+
+    @pytest.mark.anyio
     async def test_create_event(self, admin_cookie):
         async with _client() as c:
             resp = await c.post(
@@ -888,6 +1078,54 @@ class TestEventCRUD:
         async with _client() as c:
             resp = await c.get("/admin/events/99999/", cookies=admin_cookie)
         assert resp.status_code == 404
+
+    @pytest.mark.anyio
+    async def test_delete_event_not_found(self, admin_cookie):
+        async with _client() as c:
+            resp = await c.post(
+                "/admin/events/99999/delete",
+                cookies=admin_cookie,
+                follow_redirects=False,
+            )
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Event not found."
+
+    @pytest.mark.anyio
+    async def test_delete_event_database_error(self, admin_cookie, seed_event, monkeypatch):
+        from sqlalchemy.exc import SQLAlchemyError
+
+        from portal.database import delete_event as real_delete_event
+
+        event, _, _ = seed_event
+
+        async def mock_delete_event(session, event_id):
+            async def fail_flush():
+                raise SQLAlchemyError("Simulated DB failure")
+
+            monkeypatch.setattr(session, "flush", fail_flush)
+            return await real_delete_event(session, event_id)
+
+        monkeypatch.setattr("portal.routers.admin.delete_event", mock_delete_event)
+
+        async with _client() as c:
+            resp = await c.post(
+                f"/admin/events/{event.id}/delete",
+                cookies=admin_cookie,
+                follow_redirects=False,
+            )
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/admin/events/?error=delete_failed"
+
+        # Verify redirect page renders error message and event was not deleted
+        import re
+
+        async with _client() as c:
+            resp = await c.get("/admin/events/?error=delete_failed", cookies=admin_cookie)
+        assert resp.status_code == 200
+        assert b"Failed to delete event" in resp.content
+        assert b"The event was not deleted." in resp.content
+        assert b"testcon" in resp.content
+        assert not re.search(rb"\sstyle\s*=", resp.content, re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -1118,6 +1356,101 @@ class TestRoomCRUD:
                 follow_redirects=False,
             )
         assert resp.status_code == 303
+
+    @pytest.mark.anyio
+    async def test_delete_room_rejects_cross_event_target_without_deleting_dependents(self, room_scope_events):
+        from portal.database import get_room_by_id, get_session
+        from portal.models import BoothMembership, DBBooth, InviteToken
+
+        scope = room_scope_events
+        async with _client() as c:
+            resp = await c.post(
+                f"/workspace/events/{scope['event_a']}/rooms/{scope['room_b']}/delete",
+                cookies=scope["owner_cookie"],
+                follow_redirects=False,
+            )
+        assert resp.status_code == 404
+        async with get_session() as s:
+            assert await get_room_by_id(s, scope["room_b"]) is not None
+            assert await s.get(DBBooth, scope["booth_b"]) is not None
+            assert await s.get(InviteToken, scope["invite_b"]) is not None
+            assert await s.get(BoothMembership, scope["booth_membership_b"]) is not None
+
+    @pytest.mark.anyio
+    async def test_delete_room_allows_own_event_and_preserves_other_event(self, room_scope_events):
+        from portal.database import get_room_by_id, get_session
+        from portal.models import DBBooth
+
+        scope = room_scope_events
+        async with _client() as c:
+            resp = await c.post(
+                f"/workspace/events/{scope['event_a']}/rooms/{scope['room_a']}/delete",
+                cookies=scope["owner_cookie"],
+                follow_redirects=False,
+            )
+        assert resp.status_code == 303
+        assert resp.headers["location"] == f"/workspace/events/{scope['event_a']}/rooms/"
+        async with get_session() as s:
+            assert await get_room_by_id(s, scope["room_a"]) is None
+            assert await s.get(DBBooth, scope["booth_a"]) is None
+            assert await get_room_by_id(s, scope["room_b"]) is not None
+            assert await s.get(DBBooth, scope["booth_b"]) is not None
+
+    @pytest.mark.anyio
+    async def test_delete_room_rejects_foreign_event_owner(self, room_scope_events):
+        from portal.database import get_room_by_id, get_session
+
+        scope = room_scope_events
+        async with _client() as c:
+            resp = await c.post(
+                f"/workspace/events/{scope['event_b']}/rooms/{scope['room_b']}/delete",
+                cookies=scope["owner_cookie"],
+                follow_redirects=False,
+            )
+        assert resp.status_code == 403
+        async with get_session() as s:
+            assert await get_room_by_id(s, scope["room_b"]) is not None
+
+    @pytest.mark.anyio
+    async def test_delete_room_returns_404_for_nonexistent_room(self, room_scope_events):
+        scope = room_scope_events
+        async with _client() as c:
+            resp = await c.post(
+                f"/workspace/events/{scope['event_a']}/rooms/99999/delete",
+                cookies=scope["owner_cookie"],
+                follow_redirects=False,
+            )
+        assert resp.status_code == 404
+
+    @pytest.mark.anyio
+    async def test_delete_room_rejects_super_admin_event_mismatch(self, admin_cookie, room_scope_events):
+        from portal.database import get_room_by_id, get_session
+
+        scope = room_scope_events
+        async with _client() as c:
+            resp = await c.post(
+                f"/admin/events/{scope['event_a']}/rooms/{scope['room_b']}/delete",
+                cookies=admin_cookie,
+                follow_redirects=False,
+            )
+        assert resp.status_code == 404
+        async with get_session() as s:
+            assert await get_room_by_id(s, scope["room_b"]) is not None
+
+    @pytest.mark.anyio
+    async def test_delete_room_preserves_legacy_coordinator_access(self, room_scope_events):
+        from portal.database import get_room_by_id, get_session
+
+        scope = room_scope_events
+        async with _client() as c:
+            resp = await c.post(
+                f"/admin/events/{scope['event_a']}/rooms/{scope['room_a']}/delete",
+                cookies=scope["coordinator_cookie"],
+                follow_redirects=False,
+            )
+        assert resp.status_code == 303
+        async with get_session() as s:
+            assert await get_room_by_id(s, scope["room_a"]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1820,6 +2153,31 @@ async def test_user_list_orders_same_join_time_by_newest_id(admin_cookie):
     body = resp.text
     # Created in a-b-c order, so ids ascend a-b-c; newest-first means c-b-a.
     assert body.index("tie-c@example.com") < body.index("tie-b@example.com") < body.index("tie-a@example.com")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("sort_field", ["__repr__", "unknown_field"])
+async def test_user_list_unsupported_sort_by_falls_back_to_default_ordering(admin_cookie, sort_field):
+    await _seed_users_with_join_dates()
+
+    async with _client() as c:
+        resp = await c.get(f"/admin/users/?sort_by={sort_field}", cookies=admin_cookie)
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert body.index("newest@example.com") < body.index("middle@example.com") < body.index("oldest@example.com")
+
+
+@pytest.mark.anyio
+async def test_user_list_valid_sort_by_orders_correctly(admin_cookie):
+    await _seed_users_with_join_dates()
+
+    async with _client() as c:
+        resp = await c.get("/admin/users/?sort_by=email&sort_order=asc", cookies=admin_cookie)
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert body.index("middle@example.com") < body.index("newest@example.com") < body.index("oldest@example.com")
 
 
 @pytest.mark.anyio
