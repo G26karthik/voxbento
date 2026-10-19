@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAIProvider(TranscriptionProvider):
+    # The realtime API takes 24 kHz PCM
+    sample_rate = 24000
+
     async def process_chunk(
         self,
         chunk: bytes,
@@ -29,7 +32,7 @@ class OpenAIProvider(TranscriptionProvider):
         if not api_key:
             logger.error("OpenAI API key missing")
             return ""
-        wav_data = pcm_to_wav(chunk)
+        wav_data = pcm_to_wav(chunk, sample_rate=self.sample_rate)
         headers = {"Authorization": f"Bearer {api_key}"}
         files = {"file": ("audio.wav", wav_data, "audio/wav")}
         data = {"model": model_variant, "language": language_code}
