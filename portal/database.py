@@ -45,9 +45,11 @@ from portal.models import (
     TranscriptSegment,
     UsageMetric,
     User,
+    generate_public_id,
     generate_token,
     utc_now,
 )
+from portal.roles import EVENT_OWNER
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +174,7 @@ async def create_event(
         membership = EventMembership(
             event_id=ev.id,
             user_id=owner_user_id,
-            role="event_owner",
+            role=EVENT_OWNER,
         )
         session.add(membership)
         await session.flush()
@@ -395,12 +397,14 @@ async def list_booths_for_event(
 
     result = await session.execute(
         select(DBBooth)
+        .join(Room, Room.id == DBBooth.room_id)
         .options(
             joinedload(DBBooth.event),
             joinedload(DBBooth.room),
             selectinload(DBBooth.translation_languages),
         )
-        .where(DBBooth.event_id == event_id)
+        # A booth must belong to the room's event; keep inconsistent rows out of every list.
+        .where(DBBooth.event_id == event_id, DBBooth.event_id == Room.event_id)
         .order_by(DBBooth.language_code)
         .limit(limit)
         .offset(offset),
@@ -423,12 +427,14 @@ async def list_all_booths_for_events(
 
     result = await session.execute(
         select(DBBooth)
+        .join(Room, Room.id == DBBooth.room_id)
         .options(
             joinedload(DBBooth.event),
             joinedload(DBBooth.room),
             selectinload(DBBooth.translation_languages),
         )
-        .where(DBBooth.event_id.in_(event_ids))
+        # A booth must belong to the room's event; keep inconsistent rows out of every list.
+        .where(DBBooth.event_id.in_(event_ids), DBBooth.event_id == Room.event_id)
         .order_by(DBBooth.event_id, DBBooth.room_id, DBBooth.language_code),
     )
     booths_by_event: dict[int, list[DBBooth]] = {eid: [] for eid in event_ids}
@@ -442,8 +448,10 @@ async def list_booths_for_room(session: AsyncSession, room_id: int) -> list[DBBo
 
     result = await session.execute(
         select(DBBooth)
+        .join(Room, Room.id == DBBooth.room_id)
         .options(joinedload(DBBooth.event), selectinload(DBBooth.translation_languages))
-        .where(DBBooth.room_id == room_id)
+        # A booth must belong to the room's event; keep inconsistent rows out of every list.
+        .where(DBBooth.room_id == room_id, DBBooth.event_id == Room.event_id)
         .order_by(DBBooth.language_code),
     )
     return list(result.scalars().all())
@@ -480,9 +488,11 @@ async def create_invite_token(
     label: str = "",
     expires_at: datetime | None = None,
     created_by: str = "",
+    public_id: str | None = None,
 ) -> InviteToken:
     token = InviteToken(
         token=generate_token(),
+        public_id=public_id or generate_public_id(),
         booth_id=booth_id,
         role=role,
         label=label,
@@ -499,6 +509,15 @@ async def get_invite_token(session: AsyncSession, token_str: str) -> InviteToken
         select(InviteToken)
         .options(joinedload(InviteToken.booth).joinedload(DBBooth.event))
         .where(InviteToken.token == token_str),
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_invite_token_by_public_id(session: AsyncSession, public_id: str) -> InviteToken | None:
+    result = await session.execute(
+        select(InviteToken)
+        .options(joinedload(InviteToken.booth).joinedload(DBBooth.event))
+        .where(InviteToken.public_id == public_id),
     )
     return result.scalar_one_or_none()
 
@@ -756,6 +775,12 @@ async def list_open_hosting_requests(session: AsyncSession) -> list[HostingReque
 
 async def count_open_hosting_requests(session: AsyncSession) -> int:
     stmt = select(func.count(HostingRequest.id)).where(HostingRequest.status == HOSTING_REQUEST_OPEN)
+    return (await session.execute(stmt)).scalar_one()
+
+
+async def count_pending_developer_accounts(session: AsyncSession) -> int:
+    """Developer API applications waiting for an Admin to approve or reject them."""
+    stmt = select(func.count(DeveloperAccount.id)).where(DeveloperAccount.status == "pending")
     return (await session.execute(stmt)).scalar_one()
 
 
@@ -1111,7 +1136,7 @@ async def save_transcript_segment(booth_id_str: str, text: str, room_id: int | N
             await session.flush()
             return segment.id
     except Exception as e:
-        logger.error(f"Failed to save transcript segment: {e}")
+        logger.error("Failed to save transcript segment: %s", e, exc_info=True)
         return None
 
 

@@ -1,6 +1,6 @@
 # VoxBento — Transcription Map
 
-> Derived from `portal/transcription/`. All facts from live implementation.
+> Derived from `portal/transcription/` and `portal/booth_identity.py`. All facts from live implementation.
 
 ---
 
@@ -14,7 +14,7 @@ Active interpreter Go Live
         │
         ▼
    MediaMTX (RTSP port 8554)
-   rtsp://mediamtx:8554/{event_slug}/{language_code}
+   rtsp://mediamtx:8554/{event_slug}/{room_id}/{language_code}
         │
         ▼
    ffmpeg (spawned by transcription worker)
@@ -31,7 +31,7 @@ Jitsi Meet Floor Conference
         │
         ▼
    ffmpeg (spawned by floor-bot)
-   Encodes to Opus → RTSP tcp push to MediaMTX:8554/{event_slug}/floor
+   Encodes to Opus → RTSP tcp push to MediaMTX:8554/{event_slug}/{room_id}/floor
 ```
 
 ### 3. Transcription & Translation Flow
@@ -56,7 +56,7 @@ Jitsi Meet Floor Conference
         ▼
    Database (TranscriptSegment target_language)
         │
-   broadcast_translation() (WebSocket /ws/translations)
+   broadcast_translation() (WebSocket /ws/captions/{target_booth_id} as 'translated_caption')
         │
         ▼
    TTS Worker (tts/worker.py)
@@ -64,7 +64,8 @@ Jitsi Meet Floor Conference
    (Deepgram Aura cloud WebSocket OR Supertonic self-hosted in-process ONNX)
         │
         ▼
-   broadcast_tts() (WebSocket /ws/tts/{room_id}) -> AudioScheduler -> Web Audio API
+   broadcast_bundle() (WebSocket /ws/tts/{room_id}/{language_code}/{booth_id}) -> AudioScheduler -> Web Audio API
+   Transmits structured binary frames (version byte, 4-byte header length, JSON header with text & metadata, optional 24 kHz mono PCM audio).
    Client uses a jitter-buffered playback queue (audio-scheduler.js) to schedule
    each audio segment seamlessly after the previous one ends, with comfort noise
    during gaps. See portal/static/js/audio-scheduler.js.
@@ -88,6 +89,8 @@ Jitsi Meet Floor Conference
 | `portal/transcription/providers/elevenlabs.py` | `ElevenLabsProvider` — scribe_v2 |
 | `portal/translations/worker.py` | `start_translation_worker()`, LLM translation loop, multithreaded translation dispatch |
 | `portal/translations/constants.py` | Translation models enum mapped to Anthropic, OpenAI, Groq, Gemini, etc. |
+| `portal/translations/prompts.py` | Contextual prompt construction incorporating room AI persona and style instructions |
+| `portal/translations/vocabulary.py` | AI interpretation vocabulary & glossary resolution, CSV import/export, and matching |
 | `portal/tts/worker.py` | `TTSWorker`, buffers punctuation, chunks text, routes to a TTS provider, pushes raw PCM binary to `tts_manager` |
 | `portal/tts/providers/` | `TTSProvider` ABC + factory; `DeepgramTTSProvider` (Aura WebSocket) and `SupertonicTTSProvider` (in-process ONNX, 44.1k→24k resample) |
 | `portal/tts/constants.py` | `DEEPGRAM_VOICE_MAPPING` (language→Aura voice) plus Supertonic preset voices, language map, and supported languages |
@@ -113,7 +116,7 @@ External provider use requires `event.transcription_api_enabled = True`.
 
 ## Worker Lifecycle
 
-### `start_transcription_worker(event_slug, language_code, booth_id, broadcast_callback, provider, model_size, config)`
+### `start_transcription_worker(event_slug, language_code, booth_id, broadcast_callback, provider, model_size, config, transcription_language=None, room_id=None)`
 
 1. Acquires `active_workers_lock`.
 2. Returns immediately if worker already running for this `booth_id`.
@@ -123,7 +126,7 @@ External provider use requires `event.transcription_api_enabled = True`.
 
 ### `transcription_worker(...)` (internal)
 
-1. Builds RTSP URL: `rtsp://mediamtx:8554/{event_slug}/{language_code}`
+1. Builds the canonical MediaMTX path with `make_mediamtx_path(event_slug, room_id, language_code)` and prefixes it with `settings.mediamtx_rtsp_base`, producing `rtsp://mediamtx:8554/{event_slug}/{room_id}/{language_code}`.
 2. Spawns ffmpeg: PCM s16le mono at `provider.sample_rate` (16kHz, 24kHz for OpenAI) via subprocess pipe.
 3. Starts `stderr_task` to drain ffmpeg stderr (debug log only).
 4. Calls `provider.run_stream(process, ...)` — blocks until stream ends.
@@ -168,6 +171,16 @@ Cancels the asyncio Task and awaits it; removes from state dicts.
 ---
 
 ## Admin Integration
+
+Guided room setup (`portal/room_setup.py`, owner-only `.../rooms/new` and
+`.../rooms/{room_id}/setup`) sets floor transcription, translation-language rows,
+and optional TTS together. AI delivery forces captions on; interpreter-only rooms
+may disable them. Available cloud speech engines require the event key and
+`transcription_api_enabled`; NVIDIA also requires its optional package and function
+ID, and Supertonic requires its optional package. Local translation and voice
+language support are checked on save. Advanced models are preserved when the
+provider is unchanged. This configures the existing pipeline; audio still needs
+to be connected through the room page's Room audio tab, and existing reconcilers own worker lifecycle.
 
 Transcription is configured per-booth via:
 - `POST /admin/events/{event_id}/rooms/{room_id}/booths/{booth_id}/transcription-settings`
